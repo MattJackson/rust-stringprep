@@ -5,6 +5,8 @@
 extern crate unicode_bidi;
 extern crate unicode_normalization;
 extern crate unicode_properties;
+#[cfg(feature = "zeroize")]
+extern crate zeroize;
 
 use std::borrow::Cow;
 use std::fmt;
@@ -12,7 +14,11 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 mod rfc3454;
+#[cfg(feature = "zeroize")]
+mod saslprep_into;
 pub mod tables;
+#[cfg(feature = "zeroize")]
+pub use saslprep_into::saslprep_into;
 
 /// Describes why a string failed stringprep normalization.
 #[derive(Debug)]
