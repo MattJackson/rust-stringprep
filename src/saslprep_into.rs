@@ -1,14 +1,18 @@
 //! SASLprep into a caller-owned buffer, for secrets such as passwords.
 
 use crate::{tables, Error, ErrorCause};
+use std::fmt;
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use zeroize::{Zeroize, Zeroizing};
 
-/// Prepares `s` with the SASLprep profile ([RFC 4013][]) into `out`, as a stored string.
+/// Prepares `s` with the SASLprep profile ([RFC 4013][]) and appends the result to `out`, as a
+/// stored string.
 ///
 /// Unlike [`saslprep`](crate::saslprep), every intermediate buffer is zeroized before it is
-/// freed or regrown, and `out` is cleared (and wiped) first and then filled with one exact-size
-/// allocation, so no copy of the prepared text is left behind in freed memory. Normalization
+/// freed or regrown, and the result is written only into `out`, the caller's own buffer (any
+/// [`fmt::Write`]: a buffer that wipes what it leaves when it grows keeps the prepared text out
+/// of freed memory). Nothing is written to `out` when preparation fails; a writer that refuses part way
+/// through keeps what it took. Normalization
 /// follows the Unicode 3.2 data that RFC 3454 is defined against: the five CJK compatibility
 /// ideographs whose decompositions were corrected after 3.2 decompose as in 3.2, and the code
 /// points whose bidirectional category changed from L after 3.2 keep their 3.2 category.
@@ -16,8 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// empty result is an error.
 ///
 /// [RFC 4013]: https://tools.ietf.org/html/rfc4013
-pub fn saslprep_into(s: &str, out: &mut Zeroizing<String>) -> Result<(), Error> {
-    out.zeroize();
+pub fn saslprep_into<W: fmt::Write + ?Sized>(s: &str, out: &mut W) -> Result<(), Error> {
     let mut chars = Zeroizing::new(Vec::new());
     for c in s.chars() {
         // 2.1 Mapping
@@ -98,10 +101,9 @@ pub fn saslprep_into(s: &str, out: &mut Zeroizing<String>) -> Result<(), Error> 
         return Err(Error(ErrorCause::ProhibitedCharacter(c)));
     }
 
-    let len = chars.iter().map(|c| c.len_utf8()).sum();
-    out.reserve_exact(len);
     for &c in chars.iter() {
-        out.push(c);
+        out.write_char(c)
+            .map_err(|_| Error(ErrorCause::OutputRefused))?;
     }
     Ok(())
 }
@@ -172,10 +174,8 @@ mod tests {
     use super::*;
 
     fn prep(s: &str) -> Option<String> {
-        let mut out = Zeroizing::new(String::new());
-        saslprep_into(s, &mut out)
-            .ok()
-            .map(|()| out.as_str().into())
+        let mut out = String::new();
+        saslprep_into(s, &mut out).ok().map(|()| out)
     }
 
     #[test]
@@ -223,9 +223,24 @@ mod tests {
     }
 
     #[test]
-    fn out_is_replaced() {
-        let mut out = Zeroizing::new(String::from("previous"));
+    fn out_is_appended_to_and_untouched_on_refusal() {
+        let mut out = String::from("previous");
         saslprep_into("x", &mut out).unwrap();
-        assert_eq!(out.as_str(), "x");
+        assert_eq!(out, "previousx");
+        assert!(saslprep_into("\u{0007}", &mut out).is_err());
+        assert_eq!(out, "previousx");
+    }
+
+    struct Refusing;
+
+    impl fmt::Write for Refusing {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            Err(fmt::Error)
+        }
+    }
+
+    #[test]
+    fn a_refusing_writer_is_an_error() {
+        assert!(saslprep_into("x", &mut Refusing).is_err());
     }
 }

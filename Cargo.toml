@@ -14,5 +14,6 @@ unicode-properties = "0.1.1"
 zeroize = { version = "1", optional = true }
 
 [features]
-# `saslprep_into`: SASLprep into a caller buffer, wiping every intermediate buffer it uses.
+# `saslprep_into`: SASLprep into a caller-owned `fmt::Write` buffer, wiping every intermediate
+# buffer it uses.
 zeroize = ["dep:zeroize"]

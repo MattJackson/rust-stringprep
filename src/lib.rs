@@ -31,6 +31,9 @@ enum ErrorCause {
     StartsWithCombiningCharacter,
     /// Empty String
     EmptyString,
+    /// The output buffer refused the prepared text.
+    #[cfg(feature = "zeroize")]
+    OutputRefused,
 }
 
 /// An error performing the stringprep algorithm.
@@ -46,6 +49,8 @@ impl fmt::Display for Error {
                 write!(fmt, "starts with combining character")
             }
             ErrorCause::EmptyString => write!(fmt, "empty string"),
+            #[cfg(feature = "zeroize")]
+            ErrorCause::OutputRefused => write!(fmt, "the output buffer refused the text"),
         }
     }
 }
