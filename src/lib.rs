@@ -1,15 +1,22 @@
 //! An implementation of the "stringprep" algorithm defined in [RFC 3454][].
 //!
 //! [RFC 3454]: https://tools.ietf.org/html/rfc3454
+//!
+//! The optional `zeroize` feature adds `saslprep_into`, a variant of `saslprep` for passwords
+//! that wipes the memory it uses.
 #![warn(missing_docs)]
 extern crate unicode_bidi;
 extern crate unicode_normalization;
 extern crate unicode_properties;
+#[cfg(feature = "zeroize")]
+extern crate zeroize;
 
 use std::borrow::Cow;
 use std::fmt;
 use unicode_normalization::UnicodeNormalization;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
+#[cfg(feature = "zeroize")]
+use zeroize::{Zeroize, Zeroizing};
 
 mod rfc3454;
 pub mod tables;
@@ -52,13 +59,91 @@ impl std::error::Error for Error {}
 ///
 /// [RFC 4013]: https://tools.ietf.org/html/rfc4013
 pub fn saslprep(s: &str) -> Result<Cow<'_, str>, Error> {
-    // fast path for ascii text
-    if s.chars()
-        .all(|c| c.is_ascii() && !tables::ascii_control_character(c))
-    {
+    if is_saslprep_fast_path(s) {
         return Ok(Cow::Borrowed(s));
     }
 
+    let mut normalized = String::new();
+    saslprep_core(s, &mut normalized)?;
+    Ok(Cow::Owned(normalized))
+}
+
+/// Prepares a string with the SASLprep profile of the stringprep algorithm into `out`, wiping
+/// memory it releases. Requires the `zeroize` feature.
+///
+/// The result, or the error, is exactly that of [`saslprep`], which shares this implementation.
+/// For secrets such as passwords: `out` is wiped and cleared first, its old buffer is wiped
+/// whenever it has to grow, and it is wiped and left empty on error.
+///
+/// One gap remains: `unicode-normalization`'s NFKC iterator keeps small internal buffers (4
+/// entries inline) that move to the heap, and are freed without being wiped, when a single
+/// character decomposes to more than 4 characters (such as U+FDFA) or more than 4 combining
+/// marks are buffered at once. The character reported in an [`Error`] and stack temporaries are
+/// also not wiped.
+///
+/// SASLprep is defined in [RFC 4013][].
+///
+/// [RFC 4013]: https://tools.ietf.org/html/rfc4013
+#[cfg(feature = "zeroize")]
+pub fn saslprep_into(s: &str, out: &mut Zeroizing<String>) -> Result<(), Error> {
+    out.zeroize();
+    if is_saslprep_fast_path(s) {
+        out.reserve_exact(s.len());
+        out.push_str(s);
+        return Ok(());
+    }
+
+    let result = saslprep_core(s, out);
+    if result.is_err() {
+        out.zeroize();
+    }
+    result
+}
+
+// ASCII text without control characters is unchanged by SASLprep.
+fn is_saslprep_fast_path(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii() && !tables::ascii_control_character(c))
+}
+
+// The output of `saslprep_core`, which builds the prepared string in it.
+trait SaslprepOut {
+    fn push_char(&mut self, c: char);
+    fn as_str(&self) -> &str;
+}
+
+impl SaslprepOut for String {
+    fn push_char(&mut self, c: char) {
+        self.push(c);
+    }
+
+    fn as_str(&self) -> &str {
+        self
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl SaslprepOut for Zeroizing<String> {
+    fn push_char(&mut self, c: char) {
+        let needed = self.len() + c.len_utf8();
+        if needed > self.capacity() {
+            // `String::push` would reallocate and free the old buffer without wiping it, so
+            // grow into a new buffer and let `Zeroizing` wipe the old one as it is dropped.
+            let capacity = needed.max(self.capacity().saturating_mul(2)).max(16);
+            let mut grown = Zeroizing::new(String::with_capacity(capacity));
+            grown.push_str(&self[..]);
+            *self = grown;
+        }
+        self.push(c);
+    }
+
+    fn as_str(&self) -> &str {
+        self
+    }
+}
+
+// SASLprep, shared by `saslprep` and `saslprep_into`: prepares `s` into `out`.
+fn saslprep_core<O: SaslprepOut>(s: &str, out: &mut O) -> Result<(), Error> {
     // 2.1 Mapping
     let mapped = s
         .chars()
@@ -72,7 +157,10 @@ pub fn saslprep(s: &str) -> Result<Cow<'_, str>, Error> {
         .filter(|&c| !tables::commonly_mapped_to_nothing(c));
 
     // 2.2 Normalization
-    let normalized = mapped.nfkc().collect::<String>();
+    for c in mapped.nfkc() {
+        out.push_char(c);
+    }
+    let normalized = out.as_str();
 
     // 2.3 Prohibited Output
     let prohibited = normalized.chars().find(|&c| {
@@ -92,7 +180,7 @@ pub fn saslprep(s: &str) -> Result<Cow<'_, str>, Error> {
     }
 
     // 2.4. Bidirectional Characters
-    if is_prohibited_bidirectional_text(&normalized) {
+    if is_prohibited_bidirectional_text(normalized) {
         return Err(Error(ErrorCause::ProhibitedBidirectionalText));
     }
 
@@ -104,7 +192,7 @@ pub fn saslprep(s: &str) -> Result<Cow<'_, str>, Error> {
         return Err(Error(ErrorCause::ProhibitedCharacter(c)));
     }
 
-    Ok(Cow::Owned(normalized))
+    Ok(())
 }
 
 // RFC3454, 6. Bidirectional Characters
@@ -331,6 +419,7 @@ pub fn x520prep(s: &str, case_fold: bool) -> Result<Cow<'_, str>, Error> {
     let normalized = if case_fold {
         mapped
             .flat_map(tables::case_fold_for_nfkc)
+            .nfkc()
             .collect::<String>()
     } else {
         mapped.nfkc().collect::<String>()
@@ -351,7 +440,7 @@ pub fn x520prep(s: &str, case_fold: bool) -> Result<Cow<'_, str>, Error> {
     }
     // From ITU-T Recommendation X.520, Section 7.4:
     // "The first code point of a string is prohibited from being a combining character."
-    match s.chars().next() {
+    match normalized.chars().next() {
         Some(c) => {
             if c.general_category_group() == GeneralCategoryGroup::Mark {
                 return Err(Error(ErrorCause::StartsWithCombiningCharacter));
@@ -423,6 +512,90 @@ mod test {
     }
 
     #[test]
+    fn x520prep_normalizes_after_case_folding() {
+        // X.520 (2019), 7.2 then 7.3: B.2 case-folding precedes Form KC.
+        for (input, expected) in [
+            ("\u{2168}", "ix"),
+            ("\u{ff21}", "a"),
+            ("A\u{030a}", "\u{00e5}"),
+        ] {
+            assert_eq!(x520prep(input, true).unwrap(), expected);
+        }
+        assert_eq!(x520prep("\u{2168}", false).unwrap(), "IX");
+        assert_eq!(x520prep("A\u{030a}", false).unwrap(), "\u{00c5}");
+    }
+
+    #[test]
+    fn x520prep_prohibits_empty_after_mapping() {
+        // X.520 (2019), 7.4 judges the string produced by mapping/normalization.
+        for case_fold in [false, true] {
+            for input in ["", "\u{00ad}", "\u{034f}", "\u{0001}"] {
+                assert!(
+                    matches!(
+                        x520prep(input, case_fold),
+                        Err(Error(ErrorCause::EmptyString))
+                    ),
+                    "{:?} must not prepare to an empty string",
+                    input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x520prep_prohibits_initial_marks_after_mapping() {
+        for case_fold in [false, true] {
+            assert_starts_with_combining_char(x520prep("\u{00ad}\u{0306}hello", case_fold));
+        }
+    }
+
+    #[test]
+    fn x520prep_accepts_a_removed_initial_mark() {
+        // The first remaining character, rather than the removed Mark, is judged.
+        for case_fold in [false, true] {
+            assert_eq!(x520prep("\u{034f}hello", case_fold).unwrap(), "hello");
+        }
+    }
+
+    #[test]
+    fn x520prep_leaves_insignificant_space_removal_to_the_matching_rule() {
+        assert_eq!(x520prep("\u{00ad}  X  ", true).unwrap(), "  x  ");
+        assert_eq!(x520prep("  X  ", false).unwrap(), "  X  ");
+    }
+
+    #[test]
+    fn x520prep_maps_control_function_characters_to_nothing() {
+        // X.520 (2019), 7.2 includes control-function characters (Cf), not only Cc.
+        for case_fold in [false, true] {
+            for control in ['\u{200e}', '\u{200f}', '\u{202e}', '\u{2060}', '\u{feff}'] {
+                let input = format!("a{}b", control);
+                assert_eq!(x520prep(&input, case_fold).unwrap(), "ab");
+            }
+            assert!(matches!(
+                x520prep("\u{200e}", case_fold),
+                Err(Error(ErrorCause::EmptyString))
+            ));
+            assert_starts_with_combining_char(x520prep("\u{200e}\u{0306}hello", case_fold));
+        }
+    }
+
+    #[test]
+    fn x520prep_preserves_the_control_whitespace_exceptions() {
+        for case_fold in [false, true] {
+            for space in [
+                '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0085}',
+            ] {
+                let input = format!("a{}b", space);
+                assert_eq!(x520prep(&input, case_fold).unwrap(), "a b");
+            }
+            // Other categories are not broadly removed along with control-function characters.
+            assert_prohibited_character(x520prep("a\u{e000}b", case_fold));
+            assert_prohibited_character(x520prep("a\u{0221}b", case_fold));
+            assert_eq!(x520prep("a\u{2000}b", case_fold).unwrap(), "a b");
+        }
+    }
+
+    #[test]
     fn ascii_optimisations() {
         if let Cow::Owned(_) = nodeprep("nodepart").unwrap() {
             panic!("“nodepart” should get optimised as ASCII");
@@ -433,5 +606,101 @@ mod test {
         if let Cow::Owned(_) = resourceprep("resourcepart").unwrap() {
             panic!("“resourcepart” should get optimised as ASCII");
         }
+        if let Cow::Owned(_) = saslprep("user password").unwrap() {
+            panic!("“user password” should get optimised as ASCII");
+        }
+    }
+
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn saslprep_into_matches_saslprep() {
+        // RFC 4013 examples, the vectors from tests/saslprep_tests.rs, and long expansions.
+        let mut inputs: Vec<String> = [
+            "I\u{00AD}X",
+            "user",
+            "USER",
+            "\u{00AA}",
+            "\u{2168}",
+            "\u{0007}",
+            "\u{0627}\u{0031}",
+            "a\u{00A0}b",
+            "a\u{007F}b",
+            "a\u{06DD}b",
+            "a\u{E000}b",
+            "a\u{1FFFE}b",
+            "a\u{FFF9}b",
+            "a\u{2FF0}b",
+            "a\u{200E}b",
+            "a\u{E0001}b",
+            "\u{0627}\u{0031}\u{0628}",
+            "a\u{0487}",
+            "",
+            "\u{00AD}",
+            "\u{FDFA}\u{FDFA}\u{FDFA}",
+        ]
+        .iter()
+        .map(|&s| s.to_owned())
+        .collect();
+        // Pseudo-random strings (fixed-seed xorshift) over characters exercising each step.
+        let alphabet: Vec<char> = "aAI1 \u{0007}\u{00A0}\u{00AA}\u{00AD}\u{0221}\u{0300}\
+            \u{0301}\u{0315}\u{0327}\u{0344}\u{0487}\u{05D0}\u{0627}\u{0661}\u{1100}\u{1161}\
+            \u{11A8}\u{200B}\u{200E}\u{2168}\u{AC00}\u{E000}\u{FB01}\u{FDFA}\u{FF76}\u{FF9E}\
+            \u{1D15E}\u{2F868}\u{E0001}"
+            .chars()
+            .collect();
+        let mut state = 0x2545_F491_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize
+        };
+        for _ in 0..20_000 {
+            let len = next() % 12;
+            inputs.push(
+                (0..len)
+                    .map(|_| alphabet[next() % alphabet.len()])
+                    .collect(),
+            );
+        }
+
+        let mut reused = Zeroizing::new(String::new());
+        for input in &inputs {
+            let expected = saslprep(input).map_err(|e| format!("{:?}", e));
+            for out in &mut [&mut reused, &mut Zeroizing::new(String::new())] {
+                let actual = saslprep_into(input, out).map_err(|e| format!("{:?}", e));
+                match (&expected, actual) {
+                    (Ok(expected), Ok(())) => assert_eq!(out.as_str(), &**expected, "{:?}", input),
+                    (Err(expected), Err(actual)) => {
+                        assert_eq!(&actual, expected, "{:?}", input);
+                        assert!(out.is_empty(), "{:?}", input);
+                    }
+                    (expected, actual) => panic!("{:?}: {:?} != {:?}", input, actual, expected),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn saslprep_into_replaces_out() {
+        let mut out = Zeroizing::new(String::from("previous contents"));
+        saslprep_into("I\u{00AD}X", &mut out).unwrap();
+        assert_eq!(out.as_str(), "IX");
+        saslprep_into("user", &mut out).unwrap();
+        assert_eq!(out.as_str(), "user");
+        assert!(saslprep_into("\u{0007}", &mut out).is_err());
+        assert_eq!(out.as_str(), "");
+    }
+
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn zeroizing_out_grows() {
+        let expected = "a\u{00E9}\u{20AC}\u{1F600}".repeat(50);
+        let mut out = Zeroizing::new(String::new());
+        for c in expected.chars() {
+            out.push_char(c);
+        }
+        assert_eq!(out.as_str(), expected);
     }
 }
